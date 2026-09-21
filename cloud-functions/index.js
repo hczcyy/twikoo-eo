@@ -1112,15 +1112,18 @@ async function commentSubmit (event, req, db, accessToken) {
   // 解析评论数据
   const data = await parseCommentData(event, req, accessToken, ip)
 
-  // 保存评论
+    // 保存评论
   const result = await db.addComment(data)
   data.id = result.id
   data._id = result.id
   res.id = result.id
 
-  // 异步处理垃圾检测和通知
-  postSubmit(data, db, createMailBridgeContext(req)).catch(e => {
-    logger.error('POST_SUBMIT 失败', e.message)
+  // 异步处理垃圾检测和通知（使用 setImmediate 彻底脱离当前请求生命周期）
+  const mailContext = createMailBridgeContext(req)
+  setImmediate(() => {
+    postSubmit(data, db, mailContext).catch(e => {
+      logger.error('POST_SUBMIT 失败', e.message)
+    })
   })
 
   return res
@@ -1161,15 +1164,23 @@ async function parseCommentData (event, req, accessToken, ip) {
     updated: timestamp
   }
 
-  // 处理 QQ 邮箱和头像
+   // 处理 QQ 邮箱和头像
   if (isQQ(event.mail)) {
     commentDo.mail = addQQMailSuffix(event.mail)
     commentDo.mailMd5 = md5(normalizeMail(commentDo.mail))
-    try {
-      commentDo.avatar = await getQQAvatar(event.mail)
-    } catch (e) {
-      logger.warn('获取 QQ 头像失败：', e.message)
-    }
+    // 头像获取改为异步，不阻塞评论提交
+    // 先用一个空字符串占位，后续异步获取到后再更新
+    commentDo.avatar = ''
+    setImmediate(async () => {
+      try {
+        const avatar = await getQQAvatar(event.mail)
+        // 注意：这里需要重新创建一个 db 实例，因为原来的 db 可能已随请求回收
+        const db = createBlobDatabase()
+        await db.updateComment(commentDo._id, { avatar })
+      } catch (e) {
+        logger.warn('获取 QQ 头像失败：', e.message)
+      }
+    })
   }
 
   return commentDo
@@ -1187,15 +1198,18 @@ async function postSubmit (comment, db, mailContext) {
       return null
     }
 
-    // 垃圾检测
+    // 垃圾检测（保留同步，因为它很快，而且影响前台可见性）
     const isSpam = await postCheckSpam(comment, config)
     if (isSpam && !comment.isSpam) {
       await db.updateComment(comment._id, { isSpam: true, updated: Date.now() })
       comment.isSpam = isSpam
     }
 
-    // 发送通知
-    await withMailBridgeContext(mailContext, () => sendNotice(comment, config, getParentComment))
+    // 发送通知：用 setImmediate 再异步一层，避免阻塞函数实例回收
+    setImmediate(() => {
+      withMailBridgeContext(mailContext, () => sendNotice(comment, config, getParentComment))
+        .catch(e => logger.warn('邮件通知失败', e.message))
+    })
   } catch (e) {
     logger.warn('POST_SUBMIT 失败', e)
   }
