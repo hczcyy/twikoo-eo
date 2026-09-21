@@ -516,7 +516,7 @@ setInterval(() => {
   Object.keys(requestTimes).forEach(key => delete requestTimes[key])
 }, 10 * 60 * 1000)
 
-// ==================== 评论过滤函数（原本在 KV 内，移除 KV 后迁移到 Blob 数据库层） ====================
+// ==================== 评论过滤函数 ====================
 
 function filterComments (comments, query) {
   if (!Object.keys(query).length) return comments
@@ -658,7 +658,6 @@ function createBlobDatabase () {
     }
   }
 }
-
 function createEoCap (db) {
   return createCap(kvStorage({
     get: (k) => db.capGet(k),
@@ -1112,23 +1111,26 @@ async function commentSubmit (event, req, db, accessToken) {
   // 解析评论数据
   const data = await parseCommentData(event, req, accessToken, ip)
 
-    // 保存评论
+  // 提取标记位后删除，避免写入 Blob
+  const needsQQAvatar = data.needsQQAvatar === true
+  delete data.needsQQAvatar
+
+  // 保存评论
   const result = await db.addComment(data)
   data.id = result.id
   data._id = result.id
   res.id = result.id
 
-  // 异步处理垃圾检测和通知（使用 setImmediate 彻底脱离当前请求生命周期）
+  // 异步处理垃圾检测和通知
   const mailContext = createMailBridgeContext(req)
   setImmediate(() => {
-    postSubmit(data, db, mailContext).catch(e => {
+    postSubmit(data, db, mailContext, needsQQAvatar).catch(e => {
       logger.error('POST_SUBMIT 失败', e.message)
     })
   })
 
   return res
 }
-
 async function parseCommentData (event, req, accessToken, ip) {
   const timestamp = Date.now()
   const isAdminUser = isAdmin(accessToken)
@@ -1164,33 +1166,21 @@ async function parseCommentData (event, req, accessToken, ip) {
     updated: timestamp
   }
 
-   // 处理 QQ 邮箱和头像
+  // 处理 QQ 邮箱
   if (isQQ(event.mail)) {
     commentDo.mail = addQQMailSuffix(event.mail)
     commentDo.mailMd5 = md5(normalizeMail(commentDo.mail))
-    // 头像获取改为异步，不阻塞评论提交
-    // 先用一个空字符串占位，后续异步获取到后再更新
-    commentDo.avatar = ''
-    setImmediate(async () => {
-      try {
-        const avatar = await getQQAvatar(event.mail)
-        // 注意：这里需要重新创建一个 db 实例，因为原来的 db 可能已随请求回收
-        const db = createBlobDatabase()
-        await db.updateComment(commentDo._id, { avatar })
-      } catch (e) {
-        logger.warn('获取 QQ 头像失败：', e.message)
-      }
-    })
+    // 头像获取统一放到 postSubmit 中异步处理，这里只标记需要获取头像
+    commentDo.needsQQAvatar = true
   }
 
   return commentDo
 }
 
-async function postSubmit (comment, db, mailContext) {
+async function postSubmit (comment, db, mailContext, needsQQAvatar) {
   try {
     logger.log('POST_SUBMIT')
 
-    // 获取父评论
     const getParentComment = async (c) => {
       if (c.pid) {
         return db.getComment(c.pid)
@@ -1198,14 +1188,29 @@ async function postSubmit (comment, db, mailContext) {
       return null
     }
 
-    // 垃圾检测（保留同步，因为它很快，而且影响前台可见性）
+    // 异步获取 QQ 头像
+    if (needsQQAvatar) {
+      setImmediate(async () => {
+        try {
+          const avatar = await getQQAvatar(comment.mail)
+          if (avatar) {
+            const db2 = createBlobDatabase()
+            await db2.updateComment(comment._id, { avatar })
+          }
+        } catch (e) {
+          logger.warn('获取 QQ 头像失败：', e.message)
+        }
+      })
+    }
+
+    // 垃圾检测
     const isSpam = await postCheckSpam(comment, config)
     if (isSpam && !comment.isSpam) {
       await db.updateComment(comment._id, { isSpam: true, updated: Date.now() })
       comment.isSpam = isSpam
     }
 
-    // 发送通知：用 setImmediate 再异步一层，避免阻塞函数实例回收
+    // 异步发通知
     setImmediate(() => {
       withMailBridgeContext(mailContext, () => sendNotice(comment, config, getParentComment))
         .catch(e => logger.warn('邮件通知失败', e.message))
