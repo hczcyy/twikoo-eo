@@ -556,83 +556,149 @@ function matchCondition (comment, key, value) {
 // ==================== Blob 数据库层 ====================
 
 const COMMENTS_KEY = 'comments:all'
-
 function createBlobDatabase () {
   const store = getStore({ name: 'twikoo', consistency: 'strong' })
   let commentsCache = null
 
+  function cloneComments (comments) {
+    // 避免调用方直接改到缓存内部引用
+    return comments.map(comment => ({ ...comment }))
+  }
+
+  async function getAllComments () {
+    if (commentsCache !== null) return commentsCache
+    commentsCache = await store.get(COMMENTS_KEY, { type: 'json' }) ?? []
+    return commentsCache
+  }
+
+  async function saveAllComments (comments) {
+    // 写回后缓存即最新整表
+    commentsCache = comments
+    await store.setJSON(COMMENTS_KEY, comments)
+  }
+
+  /**
+   * 关键修复：所有写操作前强制回源，拿到最新整表后再变更写回。
+   * 把“读 → 写”窗口从整个请求时长压缩到一次 KV 回源往返。
+   */
+  async function mutate (mutator) {
+    // 1. 强制丢弃进程内缓存，回源拿最新整表
+    commentsCache = null
+    const comments = await getAllComments()
+
+    // 2. 应用变更；mutator 返回 { comments, result }
+    const { comments: nextComments, result } = await mutator(comments)
+
+    // 3. 整表写回，并同步缓存
+    await saveAllComments(nextComments)
+
+    return result
+  }
+
   return {
     async getAllComments () {
-      if (commentsCache !== null) return commentsCache
-      commentsCache = await store.get(COMMENTS_KEY, { type: 'json' }) ?? []
-      return commentsCache
+      return getAllComments()
     },
+
     async saveAllComments (comments) {
-      commentsCache = comments
-      await store.setJSON(COMMENTS_KEY, comments)
+      return saveAllComments(comments)
     },
+
     async getComments (query = {}) {
-      const all = await this.getAllComments()
+      const all = await getAllComments()
       return filterComments(all, query)
     },
+
     async countComments (query = {}) {
       return (await this.getComments(query)).length
     },
+
     async addComment (comment) {
-      const id = comment._id || uuidv4().replace(/-/g, '')
-      comment._id = id
-      comment.id = id
-      const comments = await this.getAllComments()
-      comments.push(comment)
-      await this.saveAllComments(comments)
-      return { id }
+      return mutate(async (comments) => {
+        const id = comment._id || uuidv4().replace(/-/g, '')
+
+        // 幂等：回源后若 _id 已存在，直接跳过，避免重试重复插入
+        if (comments.some(c => c._id === id)) {
+          return { comments, result: { id } }
+        }
+
+        const next = cloneComments(comments)
+        const doc = { ...comment, _id: id, id }
+        next.push(doc)
+
+        return { comments: next, result: { id } }
+      })
     },
+
     async updateComment (id, updates) {
-      const comments = await this.getAllComments()
-      const index = comments.findIndex(c => c._id === id)
-      if (index !== -1) {
-        Object.assign(comments[index], updates)
-        await this.saveAllComments(comments)
-        return { updated: 1 }
-      }
-      return { updated: 0 }
+      return mutate(async (comments) => {
+        const next = cloneComments(comments)
+        const index = next.findIndex(c => c._id === id)
+
+        if (index !== -1) {
+          Object.assign(next[index], updates)
+          return { comments: next, result: { updated: 1 } }
+        }
+
+        return { comments: next, result: { updated: 0 } }
+      })
     },
+
     async deleteComment (id) {
-      const comments = await this.getAllComments()
-      const index = comments.findIndex(c => c._id === id)
-      if (index !== -1) {
-        comments.splice(index, 1)
-        await this.saveAllComments(comments)
-        return { deleted: 1 }
-      }
-      return { deleted: 0 }
+      return mutate(async (comments) => {
+        const next = cloneComments(comments)
+        const index = next.findIndex(c => c._id === id)
+
+        if (index !== -1) {
+          next.splice(index, 1)
+          return { comments: next, result: { deleted: 1 } }
+        }
+
+        return { comments: next, result: { deleted: 0 } }
+      })
     },
+
     async getComment (id) {
-      const comments = await this.getAllComments()
+      const comments = await getAllComments()
       return comments.find(c => c._id === id) || null
     },
+
     async bulkAddComments (newComments) {
-      const comments = await this.getAllComments()
-      for (const comment of newComments) {
-        const id = comment._id || uuidv4().replace(/-/g, '')
-        comment._id = id
-        comment.id = id
-        comments.push(comment)
-      }
-      await this.saveAllComments(comments)
-      return newComments.length
+      return mutate(async (comments) => {
+        const next = cloneComments(comments)
+        const existingIds = new Set(next.map(c => c._id))
+        let added = 0
+
+        for (const comment of newComments) {
+          const id = comment._id || uuidv4().replace(/-/g, '')
+
+          // 幂等：已存在则跳过
+          if (existingIds.has(id)) continue
+
+          const doc = { ...comment, _id: id, id }
+          next.push(doc)
+          existingIds.add(id)
+          added++
+        }
+
+        return { comments: next, result: added }
+      })
     },
+
     async getConfig () {
       return await store.get('config:main', { type: 'json' }) ?? {}
     },
+
     async saveConfig (newConfig) {
       const current = await this.getConfig()
       await store.setJSON('config:main', { ...current, ...newConfig })
       return { updated: 1 }
     },
+
     async getCounter (url) {
       return await store.get(`counter:${encodeURIComponent(url)}`, { type: 'json' })
     },
+
     async incCounter (url, title) {
       const key = `counter:${encodeURIComponent(url)}`
       let counter = await store.get(key, { type: 'json' })
@@ -646,6 +712,7 @@ function createBlobDatabase () {
       await store.setJSON(key, counter)
       return 1
     },
+
     // Cap.js KV hooks
     async capGet (key) {
       return await store.get(key, { type: 'json' })
@@ -658,6 +725,8 @@ function createBlobDatabase () {
     }
   }
 }
+
+     
 function createEoCap (db) {
   return createCap(kvStorage({
     get: (k) => db.capGet(k),
